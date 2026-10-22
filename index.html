@@ -95,21 +95,35 @@ function render(faces){
   faces.forEach((f,i)=>{
     const a=document.createElement("a");
     a.className="card";
-    a.href=`faces/${f.id}/index.html`;
-    a.innerHTML=`<span class="n">${f.title||f.id}</span>`+
-      (f.id===deflt?`<span class="def">DEFAULT</span>`:"")+
-      `<span class="key">${i+1}</span>`+
-      `<div class="tag">${f.tagline||""}</div>`+
-      `<div class="demo">&gt; watch the demo</div>`;
-    a.querySelector(".demo").addEventListener("click",e=>{
+    a.href=`faces/${encodeURIComponent(f.id)}/index.html`;
+    // textContent, never innerHTML: a face pack's face.json is
+    // third-party data (README invites dropping one in), so a title
+    // containing markup must be shown, not executed.
+    const n=document.createElement("span");
+    n.className="n"; n.textContent=f.title||f.id; a.appendChild(n);
+    if(f.id===deflt){
+      const d=document.createElement("span");
+      d.className="def"; d.textContent="DEFAULT"; a.appendChild(d);
+    }
+    const key=document.createElement("span");
+    key.className="key"; key.textContent=String(i+1); a.appendChild(key);
+    const tag=document.createElement("div");
+    tag.className="tag"; tag.textContent=f.tagline||""; a.appendChild(tag);
+    const demo=document.createElement("div");
+    demo.className="demo"; demo.textContent="> watch the demo"; a.appendChild(demo);
+    demo.addEventListener("click",e=>{
       e.preventDefault();e.stopPropagation();
-      location.href=`faces/${f.id}/index.html?demo=1`;
+      location.href=`faces/${encodeURIComponent(f.id)}/index.html?demo=1`;
     });
     cards.appendChild(a);
-    addEventListener("keydown",e=>{
-      if(e.key===String(i+1))location.href=`faces/${f.id}/index.html`;
-    });
   });
+  const onKey=e=>{
+    const i=Number(e.key)-1;
+    if(i>=0&&i<faces.length){
+      location.href=`faces/${encodeURIComponent(faces[i].id)}/index.html`;
+    }
+  };
+  addEventListener("keydown",onKey);
 }
 </script>
 </body>

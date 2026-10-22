@@ -56,6 +56,7 @@ Ctrl-C stops.
 import json
 import math
 import mimetypes
+import os
 import sys
 import threading
 import time
@@ -68,6 +69,11 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 STATES = {"idle", "listening", "thinking", "speaking"}
 WAVEFORM_STALE_S = 0.6
+# A pid file proves a voice is alive, so this only matters for an older
+# voice that does not publish one. Fifteen minutes is long enough for a
+# genuinely slow turn and short enough that a dead voice cannot lie for
+# a quarter of an hour.
+VOICE_STALE_S = 15 * 60
 
 DEFAULTS = {
     "name": "JARVIS",       # shown on the chip / headers, yours to change
@@ -107,6 +113,42 @@ PORT = int(CFG.get("port", 8790))
 if "--port" in sys.argv:
     i = sys.argv.index("--port")
     PORT = int(sys.argv[i + 1])
+
+
+def _read_pid(path):
+    """The pid a bus file names, or None. Never raises."""
+    try:
+        return int(path.read_text().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _pid_alive(pid):
+    """Ask the OS, never the file.
+
+    A pid file outlives a crash or a force-kill, so its existence proves
+    nothing; the reason it is still worth writing is that os.kill(pid, 0)
+    can prove the process is GONE and self-heal the bus. PermissionError
+    means a live process we may not signal, which is still alive.
+    """
+    if pid is None or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+# ThreadingHTTPServer runs every poll on its own thread, so the fallback
+# for an empty file needs a guard. Only the last state is shared, and the
+# worst case without this is a one-poll flicker to a slightly older state.
+_last_state = "idle"
+_last_state_lock = threading.Lock()
 
 
 def list_faces():
@@ -150,31 +192,71 @@ def mock_bus():
 def read_bus():
     if MOCK:
         return mock_bus()
+    global _last_state
+    now = time.time()
+
+    # THE STATE IS NOT A HEARTBEAT. backtalk writes it on transitions only,
+    # so "thinking for four minutes" and "died four minutes ago" look the
+    # same in the file. The pid is what separates them, and the 15-minute
+    # window is the backstop for an older voice that publishes no pid.
+    state_path = BUS / ".voice_state"
     try:
-        state = (BUS / ".voice_state").read_text().strip().lower()
-        if state not in STATES:
-            state = "idle"
+        raw_state = state_path.read_text().strip().lower()
+        state_mtime = state_path.stat().st_mtime
     except OSError:
-        state = "idle"
+        raw_state = ""
+        state_mtime = 0.0
+
+    voice_pid = _read_pid(BUS / ".voice_pid")
+    if voice_pid is not None:
+        fresh = _pid_alive(voice_pid)
+    else:
+        fresh = state_mtime > 0 and (now - state_mtime) < VOICE_STALE_S
+
+    with _last_state_lock:
+        previous = _last_state
+        if not fresh:
+            state = "idle"
+        elif raw_state in STATES:
+            state = raw_state
+        else:
+            # Empty, torn or unknown: keep what the face was already
+            # showing rather than snapping to idle for one frame. A real
+            # writer replaces the file atomically, so this only happens
+            # for an older writer or a genuinely unknown value.
+            state = previous
+        _last_state = state
+
     level = 0.0
     samples = [0.0] * 64
+    # Parse into locals FIRST, then promote. The old order set "speaking"
+    # before parsing, so a payload of ["abc"] * 64 left a talking face
+    # with a flat, dead waveform that never recovered.
+    candidate = None
     try:
         payload = json.loads((BUS / ".voice_waveform").read_text())
-        age = time.time() - float(payload.get("ts", 0))
+        age = now - float(payload.get("ts", 0))
         raw = payload.get("samples") or []
-        if raw and age < WAVEFORM_STALE_S:
-            # A fresh waveform IS speech, whatever the state file says.
-            state = "speaking"
-            samples = [float(s) for s in raw[:64]]
-            mean = sum(abs(s) for s in samples) / len(samples)
-            level = min(1.0, mean / 3000.0)
+        # age >= 0 closes the future-timestamp hole: a clock skew or a
+        # machine waking with the wrong time used to make a waveform
+        # fresh forever.
+        if raw and 0 <= age < WAVEFORM_STALE_S:
+            parsed = [float(s) for s in raw[:64]]
+            mean = sum(abs(s) for s in parsed) / len(parsed)
+            candidate = (parsed, min(1.0, mean / 3000.0))
     except (OSError, ValueError, KeyError, TypeError):
-        pass
+        candidate = None
+    if candidate is not None:
+        # A fresh waveform IS speech, whatever the state file says.
+        state = "speaking"
+        samples, level = candidate
     try:
         alert = (BUS / ".voice_alert").stat().st_size > 0
     except OSError:
         alert = False
-    loading = (BUS / ".voice_loading_pid").exists()
+    # A pid FILE is not a playing sound: the old boolean kept the
+    # browser's thinking sound muted forever after one zombie ffplay.
+    loading = _pid_alive(_read_pid(BUS / ".voice_loading_pid"))
     # Absent unless the voice line was told to publish it, which is the
     # normal case: it is the account holder's own spend and it stays off
     # until asked for. An empty dict simply means no readout.
@@ -188,7 +270,24 @@ def read_bus():
 
 
 class Handler(BaseHTTPRequestHandler):
+    # Everything the browser actually needs. The old root was HERE, which
+    # served server.py, the personal config and the whole of .git -- a
+    # browsable history and a leaked absolute bus path. Anything not on
+    # this list is a 404, whatever the path resolves to.
+    _ROOT_FILES = {"index.html", "core.js"}
+    _ROOT_DIRS = {"faces", "assets"}
+
+    def _host_ok(self):
+        # The server binds loopback only, but without this check a
+        # DNS-rebinding page in any browser on the machine could read the
+        # bus and the gallery through its own hostname.
+        host = (self.headers.get("Host") or "").strip().lower()
+        return host in (f"127.0.0.1:{PORT}", f"localhost:{PORT}")
+
     def do_GET(self):
+        if not self._host_ok():
+            self._send(b"forbidden", "text/plain", 403)
+            return
         path = self.path.split("?")[0]
         try:
             if path == "/state":
@@ -224,7 +323,14 @@ class Handler(BaseHTTPRequestHandler):
     def _static(self, path):
         if path == "/":
             path = "/index.html"
-        target = (HERE / path.lstrip("/")).resolve()
+        rel = path.lstrip("/")
+        parts = rel.split("/")
+        allowed = (rel in self._ROOT_FILES
+                   or (len(parts) > 1 and parts[0] in self._ROOT_DIRS))
+        if not allowed:
+            self._send(b"not found", "text/plain", 404)
+            return
+        target = (HERE / rel).resolve()
         if target != HERE and HERE not in target.parents:
             self._send(b"not found", "text/plain", 404)
             return
